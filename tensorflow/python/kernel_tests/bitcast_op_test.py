@@ -1,4 +1,4 @@
-# Copyright 2015 Google Inc. All Rights Reserved.
+# Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,6 +67,11 @@ class BitcastTest(tf.test.TestCase):
     datatype = tf.int8
     shape = [4]
     self._testBitcast(x, datatype, shape)
+
+  def testUnknown(self):
+    x = tf.placeholder(tf.float32)
+    datatype = tf.int8
+    tf.bitcast(x, datatype, None)
 
 
 if __name__ == "__main__":

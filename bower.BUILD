@@ -143,24 +143,6 @@ filegroup(
 )
 
 filegroup(
-    name = "iron_icons",
-    srcs = [
-        "av-icons.html",
-        "communication-icons.html",
-        "device-icons.html",
-        "editor-icons.html",
-        "hardware-icons.html",
-        "image-icons.html",
-        "index.html",
-        "iron-icons.html",
-        "maps-icons.html",
-        "notification-icons.html",
-        "places-icons.html",
-        "social-icons.html",
-    ],
-)
-
-filegroup(
     name = "iron_iconset_svg",
     srcs = [
         "index.html",
@@ -371,6 +353,9 @@ filegroup(
     srcs = [
         "index.html",
         "paper-dropdown-menu.html",
+        "paper-dropdown-menu-icons.html",
+        "paper-dropdown-menu-light.html",
+        "paper-dropdown-menu-shared-styles.html",
     ],
 )
 
@@ -387,6 +372,7 @@ filegroup(
     srcs = [
         "index.html",
         "paper-icon-button.html",
+        "paper-icon-button-light.html",
     ],
 )
 
@@ -528,6 +514,14 @@ filegroup(
     srcs = [
         "index.html",
         "paper-toolbar.html",
+    ],
+)
+
+filegroup(
+    name = "paper_tooltip",
+    srcs = [
+        "index.html",
+        "paper-tooltip.html",
     ],
 )
 

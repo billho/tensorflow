@@ -1,4 +1,4 @@
-# Copyright 2016 Google Inc. All Rights Reserved.
+# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ class DecodeAudioOpTest(tf.test.TestCase):
     with self.test_session():
       path = os.path.join(
           resource_loader.get_data_files_path(), 'testdata', filename)
-      with open(path, 'r') as f:
+      with open(path, 'rb') as f:
         contents = f.read()
 
       audio_op = ffmpeg.decode_audio(
@@ -71,6 +71,14 @@ class DecodeAudioOpTest(tf.test.TestCase):
 
   def testOgg(self):
     self._loadFileAndTest('mono_10khz.ogg', 'ogg', 0.57, 10000, 1)
+
+  def testInvalidFile(self):
+    with self.test_session():
+      contents = 'invalid file'
+      audio_op = ffmpeg.decode_audio(contents, file_format='wav',
+                                     samples_per_second=10000, channel_count=2)
+      audio = audio_op.eval()
+      self.assertEqual(audio.shape, (0, 0))
 
 
 if __name__ == '__main__':

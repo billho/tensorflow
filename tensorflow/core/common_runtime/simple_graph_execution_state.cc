@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,14 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/common_runtime/device.h"
+#include "tensorflow/core/common_runtime/optimization_registry.h"
 #include "tensorflow/core/common_runtime/simple_placer.h"
 #include "tensorflow/core/framework/graph.pb_text.h"
 #include "tensorflow/core/framework/graph_def_util.h"
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/subgraph.h"
+#include "tensorflow/core/graph/validate.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/lib/strings/stringprintf.h"
@@ -38,11 +40,12 @@ limitations under the License.
 namespace tensorflow {
 
 SimpleGraphExecutionState::SimpleGraphExecutionState(
-    const OpRegistryInterface* ops,
+    const FunctionDefLibrary& func_def_lib,
     const SimpleGraphExecutionStateOptions& options)
-    : ops_(ops),
-      device_set_(options.device_set),
+    : device_set_(options.device_set),
       session_options_(options.session_options),
+      flib_def_(
+          new FunctionLibraryDefinition(OpRegistry::Global(), func_def_lib)),
       graph_(nullptr) {
   // TODO(mrry): Publish placement visualizations or handle the log
   // placement option.
@@ -61,11 +64,12 @@ Status SimpleGraphExecutionState::Create(GraphDef* graph_def) {
 
   original_graph_def_.Swap(graph_def);
   VLOG(2) << "Incoming def: " << ProtoDebugString(original_graph_def_);
-  return AddDefaultAttrsToGraphDef(&original_graph_def_, *ops_, 0);
+  return AddDefaultAttrsToGraphDef(&original_graph_def_, *flib_def_.get(), 0);
 }
 
 Status SimpleGraphExecutionState::Extend(
-    const GraphDef& extension_def, SimpleGraphExecutionState** out) const {
+    const GraphDef& extension_def,
+    std::unique_ptr<SimpleGraphExecutionState>* out) const {
   std::unordered_set<string> new_names;
   // 1. Build an index of the new node names.
   for (const NodeDef& node : extension_def.node()) {
@@ -87,22 +91,59 @@ Status SimpleGraphExecutionState::Extend(
     }
   }
 
+  // 3. Merge the versions field.
   int old_node_size = gdef.node_size();
   gdef.mutable_node()->MergeFrom(extension_def.node());
-  TF_RETURN_IF_ERROR(AddDefaultAttrsToGraphDef(&gdef, *ops_, old_node_size));
+  TF_RETURN_IF_ERROR(
+      AddDefaultAttrsToGraphDef(&gdef, *flib_def_.get(), old_node_size));
+  // Merge versions
+  if (gdef.has_versions()) {
+    if (gdef.versions().producer() != extension_def.versions().producer()) {
+      return errors::InvalidArgument(
+          "Can't extend GraphDef at version ", gdef.versions().producer(),
+          " with graph at version ", extension_def.versions().producer());
+    }
+    VersionDef* versions = gdef.mutable_versions();
+    versions->set_min_consumer(std::max(
+        versions->min_consumer(), extension_def.versions().min_consumer()));
+    if (extension_def.versions().bad_consumers_size()) {
+      // Add new bad_consumers that aren't already marked bad.
+      //
+      // Note: This implementation is quadratic time if there are many calls to
+      // ExtendLocked with many bad consumers.  Since this is unlikely, and
+      // fixing it would require data structures outside of this routine,
+      // quadratic time it is.
+      auto* bad_consumers = versions->mutable_bad_consumers();
+      const std::unordered_set<int> existing(bad_consumers->begin(),
+                                             bad_consumers->end());
+      for (const int v : extension_def.versions().bad_consumers()) {
+        if (existing.find(v) == existing.end()) {
+          bad_consumers->Add(v);
+        }
+      }
+    }
 
-  // 3. Add the extension.
+  } else {
+    gdef.mutable_versions()->CopyFrom(extension_def.versions());
+  }
+
+  // 5. Validate that the final graphdef is valid.
+  if (gdef.versions().producer() >= 5) {
+    // Validate the graph: we assume that merging two valid graphs
+    // should maintain graph validity.
+    TF_RETURN_IF_ERROR(graph::ValidateGraphDef(gdef, *flib_def_.get()));
+  }
+
+  // 6. Add the extension.
   SimpleGraphExecutionStateOptions combined_options;
   combined_options.device_set = device_set_;
+  combined_options.session_options = session_options_;
 
-  SimpleGraphExecutionState* new_execution_state =
-      new SimpleGraphExecutionState(ops_, combined_options);
-  Status new_execution_state_status = new_execution_state->Create(&gdef);
-  if (!new_execution_state_status.ok()) {
-    delete new_execution_state;
-    return new_execution_state_status;
-  }
-  *out = new_execution_state;
+  std::unique_ptr<SimpleGraphExecutionState> new_execution_state(
+      new SimpleGraphExecutionState(flib_def_->ToProto(), combined_options));
+  TF_RETURN_IF_ERROR(new_execution_state->Create(&gdef));
+  new_execution_state->SetStatefulPlacements(GetStatefulPlacements());
+  *out = std::move(new_execution_state);
 
   // TODO(mrry): This is likely to be used for non-throughput-sensitive
   // interactive workloads, but in future we may want to transfer other
@@ -110,49 +151,107 @@ Status SimpleGraphExecutionState::Extend(
   return Status::OK();
 }
 
-Status SimpleGraphExecutionState::InitBaseGraph() {
-  std::unique_ptr<Graph> new_graph(new Graph(ops_));
+void SimpleGraphExecutionState::SaveStatefulNodes(Graph* graph) {
+  for (Node* n : graph->nodes()) {
+    if (n->op_def().is_stateful()) {
+      VLOG(2) << "Saving " << n->DebugString();
+      stateful_placements_[n->name()] = n->assigned_device_name();
+    }
+  }
+}
+
+void SimpleGraphExecutionState::RestoreStatefulNodes(Graph* graph) {
+  for (Node* n : graph->nodes()) {
+    if (n->op_def().is_stateful()) {
+      auto iter = stateful_placements_.find(n->name());
+      if (iter != stateful_placements_.end()) {
+        n->set_assigned_device_name(iter->second);
+        VLOG(2) << "Restored " << n->DebugString();
+      }
+    }
+  }
+}
+
+Status SimpleGraphExecutionState::InitBaseGraph(
+    const BuildGraphOptions& options) {
+  std::unique_ptr<Graph> new_graph(new Graph(flib_def_.get()));
   GraphConstructorOptions opts;
   TF_RETURN_IF_ERROR(
       ConvertGraphDefToGraph(opts, original_graph_def_, new_graph.get()));
+  if (session_options_ &&
+      session_options_->config.graph_options().place_pruned_graph()) {
+    // Rewrite the graph before placement.
+    TF_RETURN_IF_ERROR(subgraph::RewriteGraphForExecution(
+        new_graph.get(), options.feed_endpoints, options.fetch_endpoints,
+        options.target_nodes, device_set_->client_device()->attributes()));
+  }
+
+  // Save stateful placements before placing.
+  RestoreStatefulNodes(new_graph.get());
+
+  GraphOptimizationPassOptions optimization_options;
+  optimization_options.session_options = session_options_;
+  optimization_options.graph = &new_graph;
+  optimization_options.flib_def = flib_def_.get();
+
+  TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
+      OptimizationPassRegistry::PRE_PLACEMENT, optimization_options));
+
   SimplePlacer placer(new_graph.get(), device_set_, session_options_);
   // TODO(mrry): Consider making the SimplePlacer cancelable.
   TF_RETURN_IF_ERROR(placer.Run());
+
+  TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
+      OptimizationPassRegistry::POST_PLACEMENT, optimization_options));
+
+  SaveStatefulNodes(new_graph.get());
   graph_ = new_graph.release();
   return Status::OK();
 }
 
-Status SimpleGraphExecutionState::BuildGraph(const BuildGraphOptions& options,
-                                             ClientGraph** out) {
+Status SimpleGraphExecutionState::BuildGraph(
+    const BuildGraphOptions& options, std::unique_ptr<SimpleClientGraph>* out) {
   VLOG(1) << "BuildGraph";
   mutex_lock l(mu_);
   // Lazily initialize the base graph.
   if (!graph_) {
-    TF_RETURN_IF_ERROR(InitBaseGraph());
+    TF_RETURN_IF_ERROR(InitBaseGraph(options));
   }
 
-  std::unique_ptr<ClientGraph> cgraph(new ClientGraph(ops_));
-  CopyGraph(*graph_, &cgraph->graph);
+  std::unique_ptr<Graph> ng(new Graph(flib_def_.get()));
+  CopyGraph(*graph_, ng.get());
 
-  // Extract the subset of the graph that needs to be run, adding feed/fetch
-  // ops as needed.
-  TF_RETURN_IF_ERROR(subgraph::RewriteGraphForExecution(
-      &cgraph->graph, options.feed_endpoints, options.fetch_endpoints,
-      options.target_nodes, device_set_->client_device()->attributes()));
+  if (session_options_ == nullptr ||
+      !session_options_->config.graph_options().place_pruned_graph()) {
+    // Extract the subset of the graph that needs to be run, adding feed/fetch
+    // ops as needed.
+    TF_RETURN_IF_ERROR(subgraph::RewriteGraphForExecution(
+        ng.get(), options.feed_endpoints, options.fetch_endpoints,
+        options.target_nodes, device_set_->client_device()->attributes()));
+  }
+
+  // Make a fresh copy of the function library for the client graph.
+  std::unique_ptr<FunctionLibraryDefinition> flib(
+      new FunctionLibraryDefinition(*flib_def_));
+
+  GraphOptimizationPassOptions optimization_options;
+  optimization_options.session_options = session_options_;
+  optimization_options.graph = &ng;
+  optimization_options.flib_def = flib.get();
+
+  TF_RETURN_IF_ERROR(OptimizationPassRegistry::Global()->RunGrouping(
+      OptimizationPassRegistry::POST_REWRITE_FOR_EXEC, optimization_options));
 
   // Copy the extracted graph in order to make its node ids dense,
   // since the local CostModel used to record its stats is sized by
   // the largest node id.
-  {
-    std::unique_ptr<ClientGraph> dense_copy(new ClientGraph(ops_));
-    CopyGraph(cgraph->graph, &dense_copy->graph);
-    cgraph = std::move(dense_copy);
-  }
+  std::unique_ptr<SimpleClientGraph> dense_copy(
+      new SimpleClientGraph(std::move(flib)));
+  CopyGraph(*ng, &dense_copy->graph);
 
   // TODO(vrv): We should check invariants of the graph here.
 
-  *out = cgraph.release();
-
+  *out = std::move(dense_copy);
   return Status::OK();
 }
 

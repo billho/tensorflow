@@ -1,4 +1,4 @@
-/* Copyright 2016 Google Inc. All Rights Reserved.
+/* Copyright 2016 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -183,7 +183,7 @@ class Call : public UntypedCall<Service> {
   // call is cancelled by the client.
   void SetCancelCallback(std::function<void()> callback) {
     mutex_lock l(mu_);
-    cancel_callback_ = callback;
+    cancel_callback_ = std::move(callback);
   }
 
   // Clears any cancellation callback that has been registered for this call.

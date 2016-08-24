@@ -1,4 +1,4 @@
-/* Copyright 2015 Google Inc. All Rights Reserved.
+/* Copyright 2015 The TensorFlow Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,7 +22,9 @@ limitations under the License.
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/platform/mutex.h"
 #include "tensorflow/core/platform/types.h"
+#include "tensorflow/core/protobuf/config.pb_text.h"
 #include "tensorflow/core/public/session_options.h"
+
 namespace tensorflow {
 namespace {
 
@@ -59,7 +61,7 @@ const string RegisteredFactoriesErrorMessageLocked() {
 }
 string SessionOptionsToString(const SessionOptions& options) {
   return strings::StrCat("target: \"", options.target, "\" config: ",
-                         options.config.ShortDebugString());
+                         ProtoShortDebugString(options.config));
 }
 }  // namespace
 
